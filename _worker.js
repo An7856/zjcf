@@ -11,12 +11,9 @@ const KC = 'cfip_list', KD = 'fdip_list', KP = 'admin_password', KU = 'user_uuid
 const K_SETTINGS = 'SYSTEM_CONFIG';
 let cc = null, ct = 0, CD = 60 * 1000;
 const STALE_CD = 60 * 60 * 1000;
-const MFS = 1000;
 const dnsCache = new Map();
-const serverHealthStats = new Map();
 const loginAttempts = new Map();
 const join = (...a) => a.join('');
-const rand = () => Math.random();
 const KS = 'user_sessions';
 const SESSION_DURATION = 8 * 60 * 60 * 1000;
 let ev = true;
@@ -638,63 +635,32 @@ async function resolveHostname(h) {
 }
 
 async function universalConnectWithFailover() {
-    if (serverHealthStats.size > 100) serverHealthStats.clear();
-    
     const valid = fdc.filter(s => s && s.trim() !== '');
-    const all = [...valid];
-    if (all.length === 0) all.push('Kr.tp50000.netlib.re');
-    
-    const sorted = all.sort((a, b) => {
-        const scoreA = serverHealthStats.get(a) || 0;
-        const scoreB = serverHealthStats.get(b) || 0;
-        if (scoreA === scoreB) return 0.5 - Math.random();
-        return scoreB - scoreA;
-    });
+    if (valid.length === 0) valid.push('Kr.tp50000.netlib.re');
 
-    const candidates = sorted.slice(0, 3);
+    let lastError = null;
 
-    const tryConnect = async (s) => {
-        const { hostname, port } = IPParser.parseConnectionAddress(s);
-        const rh = await optimizedResolveHostname(hostname);
-        const socket = await connect({ 
-            hostname: rh, 
-            port: port, 
-            connectTimeout: globalTimeout,
-            allowHalfOpen: true 
-        });
-        serverHealthStats.set(s, (serverHealthStats.get(s) || 0) + 1);
-        return { socket, server: { hostname: rh, port: port, original: s } };
-    };
+    for (const s of valid) {
+        try {
+            const { hostname, port } = IPParser.parseConnectionAddress(s);
+            const rh = await optimizedResolveHostname(hostname);
+            
+            const socket = await connect({ 
+                hostname: rh, 
+                port: port, 
+                connectTimeout: 1500, 
+                allowHalfOpen: true 
+            });
 
-    try {
-        return await tryConnect(candidates[0]);
-    } catch (e) {
-        serverHealthStats.set(candidates[0], (serverHealthStats.get(candidates[0]) || 0) - 2);
-        
-        if (candidates.length > 1) {
-            const remaining = candidates.slice(1);
-            try {
-                return await Promise.any(remaining.map(s => tryConnect(s).catch(err => {
-                    serverHealthStats.set(s, (serverHealthStats.get(s) || 0) - 2);
-                    throw err;
-                })));
-            } catch (err) {
-                throw new Error('All connections failed');
-            }
+            return { socket, server: { hostname: rh, port: port, original: s } };
+
+        } catch (e) {
+            lastError = e;
+            continue;
         }
-        throw e;
     }
-}
 
-function obfuscateUserAgent() {
-    const uas = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0'
-    ];
-    return uas[Math.floor(rand() * uas.length)];
+    throw lastError || new Error('所有反代IP均连接失败');
 }
 
 function safeCloseWebSocket(socket) {
@@ -1033,78 +999,48 @@ async function handleTCP(remote, addr, pt, raw, ws, vh, proxyCtx) {
 }
 
 async function createConnection(host, port, proxyCtx, addressType = 3) {
-    async function useSocks5Pattern(address, whitelist) {
-        if (!whitelist || whitelist.length === 0) return false;
-        
-        const targetHost = address.toLowerCase();
-        
-        return whitelist.some(pattern => {
-            const p = pattern.trim().toLowerCase();
-            if (!p) return false;
-
-            if (p === '*') return true;
-
-            if (p.includes('*') || p.includes('?')) {
-                const escapeRegex = (str) => str.replace(/[.+^${}()|[\]\\]/g, '\\$&');
-                const regexString = '^' + escapeRegex(p).replace(/\*/g, '.*').replace(/\?/g, '.') + '$';
-                try {
-                    return new RegExp(regexString).test(targetHost);
-                } catch (e) {
-                    return false;
-                }
-            }
-            
-            if (targetHost === p || targetHost.endsWith('.' + p)) {
-                return true;
-            }
-            
-            return false;
-        });
-    }
-
-    const { enableType, global, whitelist, parsedAddress } = proxyCtx;
-    let shouldUseProxy = global;
-    
-    if (!shouldUseProxy && enableType) {
-        shouldUseProxy = await useSocks5Pattern(host, whitelist);
-    }
-
-    let sock = null;
-
-    if (shouldUseProxy && enableType) {
+    const { enableType, global, parsedAddress } = proxyCtx;
+    const tryDirect = async () => {
         try {
-            if (enableType === 'socks5') {
-                sock = await socks5Connect(host, port, parsedAddress, addressType);
-            } else if (enableType === 'http') {
-                sock = await httpConnect(host, port, parsedAddress);
-            }
+            const s = connect({ hostname: host, port: port, connectTimeout: globalTimeout, allowHalfOpen: true });
+            await s.opened;
+            return s;
         } catch (e) {
+            return null;
         }
-    }
-
-    if (!sock) {
+    };
+    const tryProxy = async () => {
+        if (!enableType || !parsedAddress) return null;
         try {
-            sock = connect({ 
-                hostname: host, 
-                port, 
-                connectTimeout: globalTimeout,
-                allowHalfOpen: true
-            });
-            await sock.opened;
+            if (enableType === 'socks5') return await socks5Connect(host, port, parsedAddress, addressType);
+            if (enableType === 'http') return await httpConnect(host, port, parsedAddress);
         } catch (e) {
-            sock = null;
+            return null;
         }
-    }
-
-    if (!sock) {
+        return null;
+    };
+    const tryReverse = async () => {
         try {
             const { socket } = await universalConnectWithFailover();
-            sock = socket;
-        } catch (failoverErr) {
-            throw new Error(`连接失败: 代/直/反均不可用. 目标: ${host}:${port}`);
+            return socket;
+        } catch (e) {
+            return null;
         }
+    };
+    let sock = null;
+    if (global) {
+        sock = await tryProxy();
+        if (!sock) sock = await tryDirect();
+    } else {
+        sock = await tryDirect();
+        if (!sock) sock = await tryProxy();
     }
-
+    if (!sock) {
+        sock = await tryReverse();
+    }
+    if (!sock) {
+        throw new Error(`连接失败: 直连/代理/反代三层均不可用. 目标: ${host}:${port}`);
+    }
     return sock;
 }
 
@@ -1507,7 +1443,7 @@ async function getRequestProxyConfig(request, config) {
         enableType: config.proxyConfig?.enabled ? config.proxyConfig.type : null,
         global: config.proxyConfig?.global || false,
         account: config.proxyConfig?.account || '',
-        whitelist: config.proxyConfig?.whitelist || ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'],
+        whitelist: [],
         parsedAddress: {}
     };
 
@@ -1591,18 +1527,6 @@ function base64ToArrayBuffer(b64) {
         return { earlyData: buf.buffer, error: null };
     } catch (e) {
         return { error: e };
-    }
-}
-
-function sendWithRetry(sendFn) {
-    for (let i = 0; i < 3; i++) {
-        try {
-            return sendFn();
-        } catch (e) {
-            if (i === 2) throw e;
-            const jitter = 0.8 + Math.random() * 0.4;
-            return new Promise(resolve => setTimeout(resolve, 1000 * (i + 1) * jitter)).then(() => sendWithRetry(sendFn));
-        }
     }
 }
 
@@ -1940,14 +1864,6 @@ export default {
         }
     },
 };
-
-async function 整理成数组(内容) {
-    var 替换后的内容 = 内容.replace(/[	"'\r\n]+/g, ',').replace(/,+/g, ',');
-    if (替换后的内容.charAt(0) == ',') 替换后的内容 = 替换后的内容.slice(1);
-    if (替换后的内容.charAt(替换后的内容.length - 1) == ',') 替换后的内容 = 替换后的内容.slice(0, 替换后的内容.length - 1);
-    const 地址数组 = 替换后的内容.split(',');
-    return 地址数组;
-}
 
 async function getHomePage(req, env) {
     const host = req.headers.get('Host');
@@ -2654,7 +2570,7 @@ async function getMainPageContent(host, base, pw, uuid, env) {
                 代理状态
             </div>
             <div class="info-value">
-                ${isGlobal ? '全局代理' : '名单代理'} | ${proxyType === 'http' ? 'HTTP' : 'SOCKS5'}
+                ${isGlobal ? '全局代理' : '反代代理'} | ${proxyType === 'http' ? 'HTTP' : 'SOCKS5'}
             </div>
         </div>
     ` : '';
@@ -3528,7 +3444,6 @@ async function handleAdminSave(req, env) {
         const proxyType = form.get('proxy_type') || 'socks5';
         const proxyAccount = form.get('proxy_account') || '';
         const proxyMode = form.get('proxy_mode') || 'whitelist';
-        const proxyWhitelist = form.get('proxy_whitelist') || '';
         const loginPath = form.get('login_path') || 'login';
         
         if (u && !UUIDUtils.isValidUUID(u)) {
@@ -3580,7 +3495,7 @@ async function handleAdminSave(req, env) {
             type: proxyType,
             account: proxyAccount,
             global: proxyMode === 'global',
-            whitelist: proxyWhitelist.split('\n').map(x => x.trim()).filter(Boolean)
+            whitelist: []
         };
         const ok1 = await saveConfigToKV(env, cfipArr, fdipArr, u, protocolCfg, cfCfg, proxyCfg, loginPath);
         const ok2 = await savePrefixConfigToKV(env, clashP, singP);
@@ -3697,7 +3612,7 @@ async function getAdminPage(req, env) {
                 <div style="display: flex; gap: 15px; flex-wrap: wrap;">
                     <label style="display: flex; align-items: center; cursor: pointer;">
                         <input type="radio" name="proxy_mode" value="whitelist" ${!proxyConfig.global ? 'checked' : ''} style="margin-right: 8px;">
-                        <span>名单代理</span>
+                        <span>反代代理</span>
                     </label>
                     <label style="display: flex; align-items: center; cursor: pointer;">
                         <input type="radio" name="proxy_mode" value="global" ${proxyConfig.global ? 'checked' : ''} style="margin-right: 8px;">
@@ -3705,23 +3620,8 @@ async function getAdminPage(req, env) {
                     </label>
                 </div>
                 <div class="form-help">
-                    • <strong>名单代理</strong>: 仅对白名单内的域名使用代理（推荐）<br>
-                    • <strong>全局代理</strong>: 所有连接都通过代理（性能较低）
-                </div>
-            </div>
-            
-            <div class="form-group">
-                <label for="proxy_whitelist" class="form-label">代理白名单（每行一个域名）</label>
-                <textarea 
-                    id="proxy_whitelist" 
-                    name="proxy_whitelist" 
-                    class="form-textarea" 
-                    placeholder="请输入需要代理的域名，每行一个&#10;支持通配符，例如：*.example.com&#10;默认包含常见CDN域名"
-                    style="min-height: 100px;"
-                >${(proxyConfig.whitelist || []).join('\n')}</textarea>
-                <div class="form-help">
-                    名单代理模式下，只有匹配这些模式的域名才会通过代理连接<br>
-                    支持通配符：<code>*</code> 匹配任意字符，<code>?</code> 匹配单个字符
+                    • <strong>反代代理</strong>: 默认直连，失败后自动尝试走代理，最后尝试反代IP<br>
+                    • <strong>全局代理</strong>: 强制优先走代理，失败后尝试直连，最后尝试反代IP
                 </div>
             </div>
             
